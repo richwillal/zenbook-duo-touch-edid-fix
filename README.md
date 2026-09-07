@@ -104,6 +104,41 @@ Removes the `drm.edid_firmware=` entry for that connector from GRUB,
 deletes the installed firmware file, and runs `update-grub`. Reboot to
 apply.
 
+### Verifying independently
+
+`verify-edid.sh` is also a standalone script, so you (or anyone else) can
+run just the verification check without pulling in the fixing logic:
+
+```bash
+./verify-edid.sh              # checks every drm.edid_firmware= entry found
+./verify-edid.sh eDP-2        # checks only this connector
+```
+
+For each configured connector it confirms the firmware file exists, the
+connector is connected, and -- the check that actually matters -- that
+the connector's **live** EDID (what the kernel is using right now) is
+byte-for-byte identical to the configured firmware file. Exits non-zero
+if anything doesn't match, so it's safe to use in scripts.
+
+## Testing
+
+`edid_tool.py`'s patch logic is checked against a real, independently
+hand-created fix, not just plausibility: `test/fixtures/` contains an
+unmodified EDID dump from a Zenbook Duo's top panel (serial 0) and the
+bottom panel's EDID as it was manually patched by hand -- byte editing
+and checksum recomputation done directly, before this tool existed --
+which is the actual fix currently running on that hardware.
+
+```bash
+./test/run-tests.sh
+```
+
+This patches the original fixture with the tool and asserts the result
+is byte-for-byte identical to the manual fix, along with checks that
+only the serial and checksum bytes ever change and that the checksum is
+valid. Both fixture files are just hardware-identifying EDID data (panel
+model and, post-fix, an arbitrary serial) -- nothing user-identifying.
+
 ## Troubleshooting
 
 **`verify` shows the live EDID still has the old serial after rebooting.**

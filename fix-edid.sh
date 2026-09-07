@@ -37,9 +37,11 @@ Usage:
       higher than the highest one currently seen among its duplicate
       group. --dry-run shows what would happen without changing anything.
 
-  $0 verify <connector>
-      Check whether the override for <connector> is actually active on
+  $0 verify [connector ...]
+      Check whether the configured override(s) are actually active on
       the currently running system (i.e. you've rebooted since fixing).
+      With no arguments, verifies every configured connector. Equivalent
+      to running ./verify-edid.sh directly.
 
   $0 revert <connector>
       Remove the override for <connector>: drops it from the GRUB
@@ -247,36 +249,10 @@ PYEOF
 }
 
 cmd_verify() {
-    local connector="$1"
-    local dir="/sys/class/drm/*-${connector}"
-    local status_file
-    status_file=$(ls -d ${dir}/status 2>/dev/null | head -n1) || true
-    if [ -z "${status_file}" ]; then
-        echo "Connector '${connector}' not found under /sys/class/drm." >&2
-        exit 1
-    fi
-    local edid_file="${status_file%status}edid"
-    local tmp
-    tmp="$(mktemp)"
-    cat "${edid_file}" > "${tmp}"
-    echo "Live EDID currently in use for ${connector}:"
-    python3 "${EDID_TOOL}" info "${tmp}"
-    rm -f "${tmp}"
-
-    local fw_file
-    fw_file=$(grep -o "${connector}:edid/[^, \"]*" "${GRUB_FILE}" 2>/dev/null | head -n1 | cut -d: -f2) || true
-    if [ -z "${fw_file}" ]; then
-        echo
-        echo "No drm.edid_firmware entry found for ${connector} in ${GRUB_FILE}."
-        exit 1
-    fi
-    echo
-    echo "Configured override file: /lib/firmware/${fw_file}"
-    if [ -r "/lib/firmware/${fw_file}" ]; then
-        python3 "${EDID_TOOL}" info "/lib/firmware/${fw_file}"
-    else
-        echo "(not readable -- check it was installed correctly)"
-    fi
+    # Delegates to verify-edid.sh, the canonical live-vs-configured
+    # comparison, so there's one implementation of that check rather
+    # than two that could drift apart.
+    "${SCRIPT_DIR}/verify-edid.sh" "$@"
 }
 
 cmd_revert() {
@@ -344,8 +320,7 @@ main() {
             ;;
         verify)
             shift
-            [ $# -eq 1 ] || { usage; exit 1; }
-            cmd_verify "$1"
+            cmd_verify "$@"
             ;;
         revert)
             shift
