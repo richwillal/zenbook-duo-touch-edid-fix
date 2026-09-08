@@ -81,6 +81,9 @@ scan_connectors() {
         cat "${edid_file}" > "${tmp}"
         local info serial product identity
         info="$(python3 "${EDID_TOOL}" info "${tmp}" 2>/dev/null)" || { rm -f "${tmp}"; continue; }
+        # Pull the individual fields we need back out of edid_tool.py's
+        # JSON output -- simplest way to consume it from bash without a
+        # dedicated JSON-parsing dependency.
         serial="$(echo "${info}" | python3 -c 'import json,sys; print(json.load(sys.stdin)["serial"])')"
         product="$(echo "${info}" | python3 -c 'import json,sys; print(json.load(sys.stdin)["product_name"] or "?")')"
         # identity = everything except the serial (bytes 0-11) and checksum,
@@ -251,6 +254,12 @@ update_grub_cmdline() {
     sudo cp "${GRUB_FILE}" "${backup}"
     echo "Backed up ${GRUB_FILE} to ${backup}"
 
+    # Intent: add or update this connector's drm.edid_firmware= entry in
+    # /etc/default/grub's GRUB_CMDLINE_LINUX line without disturbing any
+    # other kernel parameters already there, and without clobbering
+    # other connectors that might already have their own EDID override
+    # (the kernel parameter supports a comma-separated list of
+    # connector:file pairs, e.g. "eDP-1:a.bin,eDP-2:b.bin").
     sudo python3 - "${GRUB_FILE}" "${connector}" "${fw_ref}" <<'PYEOF'
 import re
 import sys
@@ -260,6 +269,10 @@ grub_file, connector, fw_ref = sys.argv[1:4]
 with open(grub_file) as f:
     lines = f.readlines()
 
+# Matches a line like GRUB_CMDLINE_LINUX="quiet splash foo=bar" and
+# captures the variable-name prefix and the quoted value separately, so
+# we can rewrite just the value while leaving the rest of the line
+# (indentation, trailing whitespace shape) alone.
 pattern = re.compile(r'^(GRUB_CMDLINE_LINUX=)"(.*)"\s*$')
 found = False
 for i, line in enumerate(lines):
@@ -269,6 +282,10 @@ for i, line in enumerate(lines):
     found = True
     prefix, value = m.group(1), m.group(2)
     tokens = value.split()
+    # entries holds any existing drm.edid_firmware= connector:file pairs
+    # (as a dict so re-running this for the same connector overwrites
+    # its entry instead of appending a duplicate); other_tokens holds
+    # every unrelated kernel parameter, preserved as-is and in order.
     entries = {}
     other_tokens = []
     for tok in tokens:
@@ -279,6 +296,9 @@ for i, line in enumerate(lines):
                     entries[conn] = ref
         else:
             other_tokens.append(tok)
+    # Add/replace this connector's entry, then serialize the whole dict
+    # back into the single comma-separated drm.edid_firmware= token the
+    # kernel expects.
     entries[connector] = fw_ref
     new_edid_tok = "drm.edid_firmware=" + ",".join(f"{c}:{r}" for c, r in entries.items())
     new_value = " ".join(other_tokens + [new_edid_tok])
@@ -286,6 +306,9 @@ for i, line in enumerate(lines):
     break
 
 if not found:
+    # No GRUB_CMDLINE_LINUX line existed at all yet -- create one rather
+    # than erroring out, so this works on a config that never had a
+    # custom cmdline before.
     lines.append(f'GRUB_CMDLINE_LINUX="drm.edid_firmware={connector}:{fw_ref}"\n')
 
 with open(grub_file, "w") as f:
@@ -309,6 +332,11 @@ cmd_revert() {
     sudo cp "${GRUB_FILE}" "${backup}"
     echo "Backed up ${GRUB_FILE} to ${backup}"
 
+    # Intent: the inverse of update_grub_cmdline() above -- remove just
+    # this connector's entry from the drm.edid_firmware= comma list
+    # (dropping the whole parameter if it was the only entry), leaving
+    # every other kernel parameter, and any other connector's override,
+    # untouched.
     sudo python3 - "${GRUB_FILE}" "${connector}" <<'PYEOF'
 import re
 import sys
@@ -318,6 +346,7 @@ grub_file, connector = sys.argv[1:3]
 with open(grub_file) as f:
     lines = f.readlines()
 
+# Same GRUB_CMDLINE_LINUX="..." matcher as update_grub_cmdline() uses.
 pattern = re.compile(r'^(GRUB_CMDLINE_LINUX=)"(.*)"\s*$')
 for i, line in enumerate(lines):
     m = pattern.match(line)
@@ -333,9 +362,13 @@ for i, line in enumerate(lines):
                 if ":" in pair:
                     conn, ref = pair.split(":", 1)
                     entries[conn] = ref
+            # Drop this connector specifically; any other connectors'
+            # overrides in the same comma list are kept.
             entries.pop(connector, None)
             if entries:
                 other_tokens.append("drm.edid_firmware=" + ",".join(f"{c}:{r}" for c, r in entries.items()))
+            # else: no entries left at all, so drop the whole
+            # drm.edid_firmware= token rather than leaving an empty one.
         else:
             other_tokens.append(tok)
     lines[i] = f'{prefix}"{" ".join(other_tokens)}"\n'
