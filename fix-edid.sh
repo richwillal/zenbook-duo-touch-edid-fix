@@ -33,9 +33,11 @@ Usage:
 
   $0 fix <connector> [--serial N] [--dry-run]
       Patch <connector>'s EDID with a new serial number and install it
-      as a boot-time override. Defaults to picking a serial number one
-      higher than the highest one currently seen among its duplicate
-      group. --dry-run shows what would happen without changing anything.
+      as a boot-time override. Auto-picks a serial number one higher
+      than the highest one currently seen among its duplicate group,
+      and prompts interactively to accept or override it unless --serial
+      is given or there's no terminal to prompt on. --dry-run shows what
+      would happen without changing anything.
 
   $0 verify [connector ...]
       Check whether the configured override(s) are actually active on
@@ -121,10 +123,10 @@ find_connector_row() {
 
 cmd_fix() {
     local connector="$1"; shift
-    local new_serial="" dry_run=false
+    local new_serial="" serial_given=false dry_run=false
     while [ $# -gt 0 ]; do
         case "$1" in
-            --serial) new_serial="$2"; shift 2 ;;
+            --serial) new_serial="$2"; serial_given=true; shift 2 ;;
             --dry-run) dry_run=true; shift ;;
             *) echo "Unknown option: $1" >&2; exit 1 ;;
         esac
@@ -138,20 +140,66 @@ cmd_fix() {
     }
     IFS=$'\t' read -r _ current_serial product identity tmp_edid <<< "${row}"
 
-    if [ -z "${new_serial}" ]; then
-        # Pick one higher than the max serial among the same duplicate group.
-        local max_serial=0 s
+    # Serials already in use within this connector's duplicate group --
+    # used both to auto-pick a non-conflicting default and to reject a
+    # manually-entered one that would collide.
+    group_serials() {
+        local s
         while IFS=$'\t' read -r c s p id t; do
             [ "${id}" = "${identity}" ] || { rm -f "${t}"; continue; }
-            [ "${s}" -gt "${max_serial}" ] && max_serial="${s}"
+            echo "${s}"
             rm -f "${t}"
         done < <(scan_connectors)
-        new_serial=$((max_serial + 1))
-    fi
+    }
+
+    local auto_picked=0 s
+    while read -r s; do
+        [ "${s}" -gt "${auto_picked}" ] && auto_picked="${s}"
+    done < <(group_serials)
+    auto_picked=$((auto_picked + 1))
 
     echo "Connector:       eDP-... (${connector})"
     echo "Product:         ${product}"
     echo "Current serial:  ${current_serial}"
+
+    if ${serial_given}; then
+        if ! [[ "${new_serial}" =~ ^[0-9]+$ ]]; then
+            echo "Serial must be a non-negative integer, got: ${new_serial}" >&2
+            exit 1
+        fi
+        if group_serials | grep -qx "${new_serial}"; then
+            echo "Serial ${new_serial} is already in use by another panel in this group -- pick a different one." >&2
+            exit 1
+        fi
+    fi
+
+    if [ -z "${new_serial}" ]; then
+        new_serial="${auto_picked}"
+    fi
+
+    # Prompt interactively unless a serial was already given on the
+    # command line, or there's no terminal to prompt on (e.g. running
+    # from a script or CI) -- this matters if a future ASUS revision
+    # ships a different default serial and the auto-picked value needs
+    # a manual override without having to know about --serial up front.
+    if ! ${serial_given} && [ -t 0 ]; then
+        echo "Auto-picked new serial: ${auto_picked}"
+        while true; do
+            read -r -p "Enter serial to use [${auto_picked}]: " entered
+            [ -z "${entered}" ] && entered="${auto_picked}"
+            if ! [[ "${entered}" =~ ^[0-9]+$ ]]; then
+                echo "Serial must be a non-negative integer." >&2
+                continue
+            fi
+            if group_serials | grep -qx "${entered}"; then
+                echo "Serial ${entered} is already in use by another panel in this group -- pick a different one." >&2
+                continue
+            fi
+            new_serial="${entered}"
+            break
+        done
+    fi
+
     echo "New serial:      ${new_serial}"
 
     local out_name="${connector//\//-}.bin"

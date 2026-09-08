@@ -90,6 +90,26 @@ is made first), and runs `update-grub`.
 
 ### Choosing a specific serial number
 
+By default `fix` auto-picks a serial one higher than the highest one
+currently seen among the duplicate group, then prompts you to accept it
+or type a different one:
+
+```
+Current serial:  0
+Auto-picked new serial: 1
+Enter serial to use [1]: 
+```
+
+Just press Enter to accept the suggestion, or type your own (useful if
+a future ASUS firmware/hardware revision ships a different default that
+the auto-pick logic doesn't handle the way you want). A serial that
+collides with another panel already in the same duplicate group is
+rejected and re-prompted.
+
+To skip the prompt entirely (e.g. for scripting), pass `--serial`
+directly -- it's validated the same way (must be a non-negative integer,
+must not collide) and fails outright rather than re-prompting:
+
 ```bash
 ./fix-edid.sh fix eDP-2 --serial 42
 ```
