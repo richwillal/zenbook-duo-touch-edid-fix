@@ -23,6 +23,11 @@ EDID_TOOL="${SCRIPT_DIR}/edid_tool.py"
 FIRMWARE_DIR=/lib/firmware/edid
 GRUB_FILE=/etc/default/grub
 
+# usage()
+#
+# Intent: print the tool's command reference to stdout. Called for -h/
+# --help and whenever the user invokes a subcommand with missing/invalid
+# arguments, so it doubles as both documentation and an error hint.
 usage() {
     cat <<EOF
 Usage:
@@ -53,6 +58,12 @@ A reboot is required after 'fix' or 'revert' for the change to take effect.
 EOF
 }
 
+# require_root_tools()
+#
+# Intent: fail fast with a clear message if either of this script's two
+# hard dependencies (sudo, python3) is missing, rather than letting the
+# real error surface confusingly deep inside cmd_fix/cmd_revert after
+# the user has already answered prompts.
 require_root_tools() {
     if ! command -v sudo >/dev/null; then
         echo "This script needs sudo to write firmware files and update GRUB." >&2
@@ -64,8 +75,19 @@ require_root_tools() {
     fi
 }
 
-# Print one line per connected, EDID-bearing connector:
-# connector<TAB>serial<TAB>product_name<TAB>identity_key
+# scan_connectors()
+#
+# Intent: the single source of truth for "what displays are connected
+# and what do their EDIDs say" -- every other function that needs that
+# information (cmd_list, find_connector_row, the duplicate-group/serial
+# logic in cmd_fix) calls this rather than re-implementing the scan, so
+# the connected/valid-EDID filtering rules only exist in one place.
+#
+# Prints one line per connected, EDID-bearing connector in the form:
+#   connector<TAB>serial<TAB>product_name<TAB>identity_key<TAB>tmpfile
+# where tmpfile holds that connector's raw EDID bytes -- the caller is
+# responsible for deleting it once done (this function can't clean up
+# after itself since the whole point is to hand the data back).
 scan_connectors() {
     for status_file in /sys/class/drm/*/status; do
         [ -e "${status_file}" ] || continue
@@ -96,6 +118,13 @@ scan_connectors() {
     done
 }
 
+# cmd_list()
+#
+# Intent: the `list` subcommand -- give the operator a human-readable
+# table of connected displays plus an explicit call-out of any group
+# that's currently indistinguishable to the OS (identical identity, i.e.
+# same manufacturer/product), which is exactly the situation this whole
+# tool exists to resolve. Read-only; makes no changes.
 cmd_list() {
     echo "Connected displays:"
     echo
@@ -112,6 +141,10 @@ cmd_list() {
     done
     echo
     echo "Duplicate groups (same panel identity -- these are indistinguishable to the OS):"
+    # Count how many connectors share each identity key; any count > 1
+    # is a duplicate group worth flagging. For each one, re-filter the
+    # full row list down to just that identity and print the matching
+    # connector names on one line.
     echo "${rows}" | cut -f4 | sort | uniq -c | sort -rn | while read -r count identity; do
         if [ "${count}" -gt 1 ]; then
             echo "  - $(echo "${rows}" | awk -F'\t' -v id="${identity}" '$4==id {printf "%s ", $1}')"
@@ -119,11 +152,29 @@ cmd_list() {
     done
 }
 
+# find_connector_row(connector_name)
+#
+# Intent: look up a single connector's scan_connectors() row by its
+# short name (e.g. "eDP-2"), so cmd_fix doesn't need to re-scan and
+# filter inline. Fails (non-zero exit, no output) if no connected,
+# EDID-bearing connector matches the given name.
 find_connector_row() {
     local want="$1"
+    # `found` is set inside the awk program only when a matching line is
+    # printed; END{exit !found} turns "no match" into a real non-zero
+    # exit code, since awk normally exits 0 regardless of whether any
+    # pattern matched.
     scan_connectors | awk -F'\t' -v want="${want}" '$1==want {print; found=1} END{exit !found}'
 }
 
+# cmd_fix(connector, [--serial N], [--dry-run])
+#
+# Intent: the `fix` subcommand and the heart of this tool -- patch the
+# given connector's EDID with a new (non-conflicting) serial number,
+# then install it as a boot-time drm.edid_firmware= override. Handles
+# picking a safe default serial, letting the operator confirm/override
+# it interactively, previewing everything under --dry-run, and only
+# touching the filesystem/GRUB after an explicit confirmation.
 cmd_fix() {
     local connector="$1"; shift
     local new_serial="" serial_given=false dry_run=false
@@ -143,9 +194,15 @@ cmd_fix() {
     }
     IFS=$'\t' read -r _ current_serial product identity tmp_edid <<< "${row}"
 
-    # Serials already in use within this connector's duplicate group --
-    # used both to auto-pick a non-conflicting default and to reject a
-    # manually-entered one that would collide.
+    # group_serials()
+    #
+    # Intent: list the serial numbers currently in use by every
+    # connector sharing this one's identity (i.e. its "duplicate
+    # group"), used both to auto-pick a non-conflicting default and to
+    # reject a manually-entered serial that would collide with a panel
+    # already in the group. Defined inside cmd_fix (rather than
+    # top-level) because it closes over `identity`, computed just above
+    # from the connector this invocation of `fix` is operating on.
     group_serials() {
         local s
         while IFS=$'\t' read -r c s p id t; do
@@ -155,6 +212,9 @@ cmd_fix() {
         done < <(scan_connectors)
     }
 
+    # Default suggestion: one higher than the highest serial already
+    # seen in this duplicate group, so it can never collide with an
+    # existing panel regardless of what values they currently hold.
     local auto_picked=0 s
     while read -r s; do
         [ "${s}" -gt "${auto_picked}" ] && auto_picked="${s}"
@@ -246,8 +306,14 @@ cmd_fix() {
     echo "After rebooting, run: $0 verify ${connector}"
 }
 
-# Merge/replace this connector's entry within GRUB_CMDLINE_LINUX's
-# drm.edid_firmware=conn1:file1,conn2:file2 comma list.
+# update_grub_cmdline(connector, fw_ref)
+#
+# Intent: wire up the installed firmware file as a real boot-time
+# override by merging/replacing this connector's entry within
+# GRUB_CMDLINE_LINUX's drm.edid_firmware=conn1:file1,conn2:file2 comma
+# list in /etc/default/grub, then regenerating the actual boot config
+# with update-grub. Backs up the config file first since this is
+# editing a file that controls how the machine boots.
 update_grub_cmdline() {
     local connector="$1" fw_ref="$2"
     local backup="${GRUB_FILE}.bak-$(date +%Y%m%d%H%M%S)"
@@ -319,13 +385,24 @@ PYEOF
     sudo update-grub
 }
 
+# cmd_verify([connector ...])
+#
+# Intent: the `verify` subcommand. Delegates to verify-edid.sh -- the
+# canonical live-EDID-vs-configured-firmware comparison -- rather than
+# re-implementing that check here, so there's exactly one implementation
+# of it that both entry points share instead of two that could drift
+# apart.
 cmd_verify() {
-    # Delegates to verify-edid.sh, the canonical live-vs-configured
-    # comparison, so there's one implementation of that check rather
-    # than two that could drift apart.
     "${SCRIPT_DIR}/verify-edid.sh" "$@"
 }
 
+# cmd_revert(connector)
+#
+# Intent: the `revert` subcommand -- undo cmd_fix for a given connector.
+# Removes its entry from GRUB_CMDLINE_LINUX (backing up the config file
+# first, same as update_grub_cmdline), deletes the installed firmware
+# file, and regenerates the boot config. A reboot is still required
+# afterward for the live system to stop using the override.
 cmd_revert() {
     local connector="$1"
     local backup="${GRUB_FILE}.bak-$(date +%Y%m%d%H%M%S)"
@@ -389,6 +466,12 @@ PYEOF
     echo "Reverted. Reboot required for the change to take effect."
 }
 
+# main(args...)
+#
+# Intent: the script's single entry point -- validates the two hard
+# dependencies are present, then dispatches to the requested subcommand
+# based on argv[1], falling back to usage() for -h/--help, no arguments,
+# or anything unrecognized.
 main() {
     require_root_tools
     local sub="${1:-}"

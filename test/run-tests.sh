@@ -28,6 +28,11 @@ trap 'rm -rf "${WORK}"' EXIT
 pass=0
 fail=0
 
+# check(description, result_code)
+#
+# Intent: record and print one test's pass/fail outcome in a uniform
+# format, and tally it into the running pass/fail counters used for the
+# final summary line and the script's own exit code.
 check() {
     local desc="$1" result="$2"
     if [ "${result}" = "0" ]; then
@@ -39,9 +44,15 @@ check() {
     fi
 }
 
+# run(command...)
+#
+# Intent: execute a command that is *expected to sometimes fail* (e.g. a
+# `cmp` we want to assert on) and capture its exit code into the global
+# `rc`, without letting that failure trip this script's own `set -e` and
+# abort the whole test run -- so a genuinely failing assertion is
+# reported by check() instead of silently killing the script before it
+# can be reported at all.
 run() {
-    # Run "$@", capturing its exit code without letting `set -e` abort
-    # the script -- so a deliberately-failing check just gets reported.
     if "$@"; then rc=0; else rc=$?; fi
 }
 

@@ -20,6 +20,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 EDID_TOOL="${SCRIPT_DIR}/edid_tool.py"
 GRUB_FILE=/etc/default/grub
 
+# usage()
+#
+# Intent: print this script's command reference. Called for -h/--help;
+# this script otherwise takes no other flags, only optional connector
+# names, so there's nothing else to document here.
 usage() {
     echo "Usage: $0 [connector ...]"
     echo
@@ -43,6 +48,12 @@ if [ ! -r "${GRUB_FILE}" ]; then
     exit 1
 fi
 
+# Pull just the value inside GRUB_CMDLINE_LINUX="...", then pull just
+# the drm.edid_firmware=... token's value out of that -- \K resets the
+# match start so -o only captures what follows it, not the whole line.
+# `|| true` on both since grep exits non-zero (not an error here) when
+# the pattern simply isn't present, e.g. a bare cmdline with no override
+# configured yet.
 cmdline="$(grep -oP '^GRUB_CMDLINE_LINUX="\K[^"]*' "${GRUB_FILE}" || true)"
 edid_param="$(echo "${cmdline}" | grep -oP 'drm\.edid_firmware=\K\S*' || true)"
 
@@ -52,6 +63,10 @@ if [ -z "${edid_param}" ]; then
     exit 0
 fi
 
+# Parse the comma-separated connector:file list (e.g.
+# "eDP-1:a.bin,eDP-2:b.bin") into an associative array keyed by
+# connector name, so each one can be looked up and checked individually
+# below.
 declare -A configured
 IFS=',' read -ra pairs <<< "${edid_param}"
 for pair in "${pairs[@]}"; do
@@ -60,7 +75,10 @@ for pair in "${pairs[@]}"; do
     configured["${conn}"]="${ref}"
 done
 
-# Filter to requested connectors, if any were given.
+# Filter to requested connectors, if any were given: drop any entry from
+# `configured` that isn't in `wanted`, then separately warn about any
+# requested connector that had no configured entry to begin with (so a
+# typo'd connector name doesn't just get silently ignored).
 wanted=("$@")
 if [ "${#wanted[@]}" -gt 0 ]; then
     for conn in "${!configured[@]}"; do
@@ -71,6 +89,10 @@ if [ "${#wanted[@]}" -gt 0 ]; then
         [ "${keep}" = true ] || unset 'configured[$conn]'
     done
     for w in "${wanted[@]}"; do
+        # The +x expansion tests key existence without triggering
+        # `set -u` on an unset array element (a plain
+        # ${configured[$w]} would error out under nounset if $w was
+        # never a key).
         if [ -z "${configured[${w}]+x}" ]; then
             echo "WARN: ${w} has no drm.edid_firmware= entry configured -- skipping"
         fi
